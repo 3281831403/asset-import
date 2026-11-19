@@ -18,6 +18,13 @@
   ``[{"job": <job 名，拿不到名字时为 None>, "error": <错误说明 str>}, ...]``，按 jobs 输入顺序排列。
 """
 
+import hashlib
+import heapq
+import json
+import re
+import unicodedata
+from pathlib import Path
+
 __all__ = [
     "AssetError",
     "normalize_path",
@@ -37,6 +44,150 @@ class AssetError(Exception):
     任何"输入不合法 / 路径越界 / 单位未知 / 内容无法哈希 / 依赖成环但调用方要求顺序"
     的情形都抛它，不要把 ValueError、KeyError、RecursionError 泄漏给调用方。
     """
+
+
+_PERCENT_RE = re.compile(r"%([0-9A-Fa-f]{2})")
+_PERCENT_DECODE = {
+    "2e": ".",
+    "2f": "/",
+    "5c": "\\",
+    "25": "%",
+}
+
+
+def _decode_percent(text):
+    """把 %2e / %2f / %5c / %25（大小写不敏感）解码一轮，其他转义原样保留。"""
+
+    def repl(match):
+        return _PERCENT_DECODE.get(match.group(1).lower(), match.group(0))
+
+    return _PERCENT_RE.sub(repl, text)
+
+
+def _json_dumps_canonical(value):
+    """题面固定的规范 JSON 序列化；无法序列化时统一抛 AssetError。"""
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+    except (TypeError, ValueError) as exc:
+        raise AssetError(f"内容无法 JSON 序列化: {exc}") from exc
+
+
+_AXIS_MARKERS = {
+    "y-up": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+    "z-up": ((1, 0, 0), (0, 0, 1), (0, -1, 0)),
+    "x-up": ((0, -1, 0), (1, 0, 0), (0, 0, 1)),
+}
+_LEFT_FLIP = ((1, 0, 0), (0, 1, 0), (0, 0, -1))
+
+
+def _matmul(a, b):
+    return tuple(
+        tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3))
+        for i in range(3)
+    )
+
+
+def _transpose(m):
+    return tuple(tuple(m[j][i] for j in range(3)) for i in range(3))
+
+
+def _matvec(m, v):
+    return tuple(sum(m[i][k] * v[k] for k in range(3)) for i in range(3))
+
+
+def _det3(m):
+    return (
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    )
+
+
+def _axis_matrix(marker):
+    """朝向标记 -> 该坐标系到规范系（y-up 右手）的变换矩阵。"""
+    if not isinstance(marker, str):
+        raise AssetError("朝向标记必须是 str")
+    key = marker.strip().lower()
+    if key in _AXIS_MARKERS:
+        return _AXIS_MARKERS[key]
+    if key.endswith("-left") and key[: -len("-left")] in _AXIS_MARKERS:
+        return _matmul(_LEFT_FLIP, _AXIS_MARKERS[key[: -len("-left")]])
+    raise AssetError(f"非法朝向标记: {marker!r}")
+
+
+def _strongly_connected(edges):
+    """迭代版 Tarjan；返回强连通分量列表（每项是节点列表）。"""
+    index = {}
+    low = {}
+    on_stack = set()
+    stack = []
+    result = []
+    counter = [0]
+
+    for root in edges:
+        if root in index:
+            continue
+        # work 栈元素：(节点, 邻接迭代器)
+        work = [(root, iter(edges[root]))]
+        index[root] = low[root] = counter[0]
+        counter[0] += 1
+        stack.append(root)
+        on_stack.add(root)
+        while work:
+            node, it = work[-1]
+            advanced = False
+            for nxt in it:
+                if nxt not in index:
+                    index[nxt] = low[nxt] = counter[0]
+                    counter[0] += 1
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    work.append((nxt, iter(edges[nxt])))
+                    advanced = True
+                    break
+                if nxt in on_stack:
+                    low[node] = min(low[node], index[nxt])
+            if advanced:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == index[node]:
+                comp = []
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    comp.append(member)
+                    if member == node:
+                        break
+                result.append(comp)
+    return result
+
+
+def _stable_topo_order(nodes, edges):
+    """按 nodes 给出的出现顺序做稳定拓扑排序（依赖在前）。"""
+    position = {node: i for i, node in enumerate(nodes)}
+    indegree = {node: 0 for node in nodes}
+    children = {node: [] for node in nodes}
+    for node in nodes:
+        for dep in edges[node]:
+            if dep in indegree:
+                indegree[node] += 1
+                children[dep].append(node)
+    ready = [(position[n], n) for n in nodes if indegree[n] == 0]
+    heapq.heapify(ready)
+    order = []
+    while ready:
+        _, node = heapq.heappop(ready)
+        order.append(node)
+        for child in children[node]:
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                heapq.heappush(ready, (position[child], child))
+    return order
 
 
 def normalize_path(path, case_insensitive=False):
@@ -79,7 +230,64 @@ def normalize_path(path, case_insensitive=False):
     严禁用 ``path.replace("..", "")`` 之类的字符串替换来"消毒"：它既会吃掉合法文件名，
     又放过 ``..;/..;/secret.png`` 与多重编码。
     """
-    raise NotImplementedError("normalize_path 尚未实现")
+    if not isinstance(path, str):
+        raise AssetError("path 必须是 str")
+    text = path.strip()
+    if not text:
+        raise AssetError("path 不能为空")
+
+    # 2/3. 反复解码百分号转义，直到稳定（最多 5 轮）。
+    for _ in range(5):
+        text = text.replace("\\", "/")
+        decoded = _decode_percent(text)
+        if decoded == text:
+            break
+        text = decoded
+    else:
+        # 5 轮之后仍在变化：多重编码绕过。
+        if _decode_percent(text.replace("\\", "/")) != text.replace("\\", "/"):
+            raise AssetError("路径存在多重百分号编码")
+    text = text.replace("\\", "/")
+
+    # 4. Unicode NFC 归一化
+    text = unicodedata.normalize("NFC", text)
+
+    # 5. 绝对路径 / 盘符一律拒绝
+    if text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+        raise AssetError("不允许绝对路径")
+
+    # 6. 任一段含 NUL 字符即拒绝
+    if chr(0) in text:
+        raise AssetError("路径含 NUL 字符")
+
+    # 7/8. 逐段消解
+    parts = []
+    for segment in text.split("/"):
+        if segment == "" or segment == ".":
+            continue
+        # 点段变体：非空、只由 {'.', ';', ' '} 组成、且至少 2 个点
+        if (
+            segment
+            and all(ch in ".; " for ch in segment)
+            and segment.count(".") >= 2
+        ):
+            if not parts:
+                raise AssetError("路径越界")
+            parts.pop()
+            continue
+        # 单点变体（如 ".;"）视作 "."，丢弃
+        if segment and all(ch in ".; " for ch in segment) and segment.count(".") == 1:
+            continue
+        parts.append(segment)
+
+    if not parts:
+        raise AssetError("路径归一化后为空")
+
+    result = "/".join(parts)
+    if case_insensitive:
+        result = result.casefold()
+    return result
+
 
 
 def convert_units(value, from_unit, to_unit):
@@ -104,7 +312,21 @@ def convert_units(value, from_unit, to_unit):
     * ``from_unit == to_unit`` 时返回 ``float(value)``。
     * 未知单位 → ``AssetError``。
     """
-    raise NotImplementedError("convert_units 尚未实现")
+    table = {"m": 1.0, "cm": 0.01, "mm": 0.001, "inch": 0.0254}
+
+    if not isinstance(from_unit, str) or not isinstance(to_unit, str):
+        raise AssetError("单位名必须是 str")
+    src = from_unit.strip().lower()
+    dst = to_unit.strip().lower()
+    if src not in table or dst not in table:
+        raise AssetError(f"未知单位: {from_unit!r} -> {to_unit!r}")
+    try:
+        amount = float(value)
+    except (TypeError, ValueError) as exc:
+        raise AssetError(f"长度值不是数值: {value!r}") from exc
+    if src == dst:
+        return amount
+    return amount * table[src] / table[dst]
 
 
 def convert_axes(mesh, from_axis, to_axis):
@@ -146,7 +368,45 @@ def convert_axes(mesh, from_axis, to_axis):
     * 顶点必须是长度 3 的数值序列、面必须是长度 3 的整数索引，否则 ``AssetError``。
     * 不要原地修改传入的 mesh（返回新对象）。
     """
-    raise NotImplementedError("convert_axes 尚未实现")
+    from_mat = _axis_matrix(from_axis)
+    to_mat = _axis_matrix(to_axis)
+    # M = M_to^-1 @ M_from，置换矩阵的逆即转置。
+    matrix = _matmul(_transpose(to_mat), from_mat)
+    flip_winding = _det3(matrix) < 0
+
+    if not isinstance(mesh, dict):
+        raise AssetError("mesh 必须是 dict")
+    if "vertices" not in mesh or "faces" not in mesh:
+        raise AssetError("mesh 缺少 vertices / faces")
+
+    new_vertices = []
+    for vertex in mesh["vertices"]:
+        if not isinstance(vertex, (list, tuple)) or len(vertex) != 3:
+            raise AssetError("顶点必须是长度 3 的数值序列")
+        coords = []
+        for comp in vertex:
+            if isinstance(comp, bool) or not isinstance(comp, (int, float)):
+                raise AssetError("顶点坐标必须是数值")
+            coords.append(float(comp))
+        new_vertices.append(tuple(_matvec(matrix, coords)))
+
+    new_faces = []
+    for face in mesh["faces"]:
+        if not isinstance(face, (list, tuple)) or len(face) != 3:
+            raise AssetError("面必须是长度 3 的整数索引")
+        indices = []
+        for idx in face:
+            if isinstance(idx, bool) or not isinstance(idx, int):
+                raise AssetError("面索引必须是整数")
+            indices.append(idx)
+        if flip_winding:
+            indices = [indices[0], indices[2], indices[1]]
+        new_faces.append(tuple(indices))
+
+    result = dict(mesh)
+    result["vertices"] = new_vertices
+    result["faces"] = new_faces
+    return result
 
 
 def dedupe_materials(materials):
@@ -179,7 +439,27 @@ def dedupe_materials(materials):
     * 内容无法 JSON 序列化（例如 set、自定义对象）→ ``AssetError``。
     * materials 不是 dict → ``AssetError``。
     """
-    raise NotImplementedError("dedupe_materials 尚未实现")
+    if not isinstance(materials, dict):
+        raise AssetError("materials 必须是 dict")
+
+    unique = []
+    by_hash = {}
+    mapping = {}
+    for old_name, content in materials.items():
+        if not isinstance(old_name, str):
+            raise AssetError("材质名必须是 str")
+        digest = hashlib.sha256(
+            _json_dumps_canonical(content).encode("utf-8")
+        ).hexdigest()
+        entry = by_hash.get(digest)
+        if entry is None:
+            entry = {"name": old_name, "hash": digest, "sources": []}
+            by_hash[digest] = entry
+            unique.append(entry)
+        entry["sources"].append(old_name)
+        mapping[old_name] = entry["name"]
+
+    return {"unique": unique, "mapping": mapping}
 
 
 def resolve_dependencies(manifest):
@@ -213,7 +493,75 @@ def resolve_dependencies(manifest):
       绝不能抛 RecursionError（几千个节点的环也必须正常返回）。
     * manifest 不是 dict、依赖列表里混入非 str → ``AssetError``。
     """
-    raise NotImplementedError("resolve_dependencies 尚未实现")
+    if not isinstance(manifest, dict):
+        raise AssetError("manifest 必须是 dict")
+
+    order_index = {}
+    edges = {}
+    for node, deps in manifest.items():
+        if not isinstance(node, str):
+            raise AssetError("manifest 的节点名必须是 str")
+        order_index[node] = len(order_index)
+        if deps is None:
+            deps = []
+        if not isinstance(deps, (list, tuple)):
+            raise AssetError("依赖必须是列表")
+        seen = []
+        seen_set = set()
+        for dep in deps:
+            if not isinstance(dep, str):
+                raise AssetError("依赖节点名必须是 str")
+            if dep not in seen_set:
+                seen_set.add(dep)
+                seen.append(dep)
+        # 外部依赖直接忽略；只保留 manifest 内部边。
+        edges[node] = [d for d in seen if d in manifest]
+
+    # Tarjan 强连通分量（迭代实现，避免深链爆栈）。
+    components = _strongly_connected(edges)
+    node_component = {}
+    for comp_idx, comp in enumerate(components):
+        for node in comp:
+            node_component[node] = comp_idx
+
+    # 环：大小 > 1，或单节点自环（节点依赖自身）。
+    cyclic_nodes = set()
+    raw_cycles = []
+    for comp in components:
+        if len(comp) > 1:
+            cyclic_nodes.update(comp)
+            raw_cycles.append(comp)
+        elif comp[0] in edges[comp[0]]:
+            cyclic_nodes.add(comp[0])
+            raw_cycles.append(comp)
+
+    # 每个环从 manifest 中出现最早的节点起步，沿依赖边走出首尾相接的路径。
+    cycles = []
+    for comp in raw_cycles:
+        member = set(comp)
+        start = min(comp, key=lambda n: order_index[n])
+        path = [start]
+        visited = {start}
+        current = start
+        while True:
+            candidates = [d for d in edges[current] if d in member]
+            nxt = min(candidates, key=lambda n: order_index[n])
+            if nxt == start:
+                break
+            if nxt in visited:
+                # 复杂强连通分量：取一条不重复节点的闭合路径。
+                break
+            path.append(nxt)
+            visited.add(nxt)
+            current = nxt
+        cycles.append(path)
+    cycles.sort(key=lambda cyc: order_index[cyc[0]])
+
+    # 稳定拓扑序：Kahn，每次取 manifest 中出现最早的就绪节点。
+    acyclic_nodes = [node for node in manifest if node not in cyclic_nodes]
+    order = _stable_topo_order(acyclic_nodes, edges)
+
+    return {"cycles": cycles, "order": order}
 
 
 def check_missing_refs(files, refs):
@@ -239,7 +587,13 @@ def check_missing_refs(files, refs):
       不要静默跳过。
     * 历史实现根本不检查，缺失引用要到运行时才炸。
     """
-    raise NotImplementedError("check_missing_refs 尚未实现")
+    available = {normalize_path(f, case_insensitive=False) for f in files}
+    missing = set()
+    for ref in refs:
+        norm = normalize_path(ref, case_insensitive=False)
+        if norm not in available:
+            missing.add(norm)
+    return sorted(missing)
 
 
 def cache_key(settings, files):
@@ -268,7 +622,10 @@ def cache_key(settings, files):
       相同输入必须得到相同键。
     * settings 或 files 无法 JSON 序列化 → ``AssetError``。
     """
-    raise NotImplementedError("cache_key 尚未实现")
+    if not isinstance(settings, dict) or not isinstance(files, dict):
+        raise AssetError("settings 与 files 必须是 dict")
+    payload = _json_dumps_canonical({"v": 1, "settings": settings, "files": files})
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def import_batch(jobs, root):
@@ -321,4 +678,210 @@ def import_batch(jobs, root):
     * 返回前磁盘状态必须等于"什么都没导入"（成功时则等于"整批都在"），
       不允许留半成品文件或空目录。
     """
-    raise NotImplementedError("import_batch 尚未实现")
+    errors_by_index = {}
+
+    def fail(index, name, message):
+        """每个 job 只保留一条失败记录（第一条错误信息最贴近根因）。"""
+        errors_by_index.setdefault(index, ({"job": name, "error": message},))
+
+    if not isinstance(jobs, (list, tuple)):
+        return {
+            "ok": False,
+            "failed": [{"job": None, "error": "jobs 必须是 list"}],
+            "order": [],
+            "written": [],
+        }
+
+    # ---------------- 校验阶段：只读，绝不碰磁盘 ----------------
+    name_positions = {}
+    entries = []  # 每个 job 的解析结果（校验通过时）
+
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            fail(index, None, "job 必须是 dict")
+            entries.append(None)
+            continue
+        name = job.get("name")
+        if not isinstance(name, str) or not name.strip():
+            fail(index, None, "name 缺失或不是非空 str")
+            entries.append(None)
+            continue
+        if name in name_positions:
+            fail(index, name, "批内 job 重名")
+            entries.append(None)
+            continue
+        name_positions[name] = index
+        entries.append({"name": name})
+
+    # 逐 job 校验 files / deps / settings
+    job_files = {}
+    job_deps = {}
+    case_keys = {}  # casefold 路径 -> [(case-sensitive 路径, job 名)]
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict) or entries[index] is None:
+            continue
+        name = entries[index]["name"]
+        errors = []
+
+        files = job.get("files")
+        normalized = {}
+        if not isinstance(files, dict):
+            errors.append("files 必须是 dict")
+        else:
+            for raw_path, content in files.items():
+                if not isinstance(content, str):
+                    errors.append(f"文件内容必须是 str: {raw_path!r}")
+                    continue
+                try:
+                    norm = normalize_path(raw_path, case_insensitive=False)
+                except AssetError as exc:
+                    errors.append(f"非法路径 {raw_path!r}: {exc}")
+                    continue
+                normalized[norm] = content
+                ci = normalize_path(raw_path, case_insensitive=True)
+                case_keys.setdefault(ci, []).append((norm, name))
+        job_files[name] = normalized
+
+        deps = job.get("deps", [])
+        if deps is None:
+            deps = []
+        if not isinstance(deps, (list, tuple)) or any(
+            not isinstance(d, str) for d in deps
+        ):
+            errors.append("deps 必须是 str 列表")
+            deps = []
+        job_deps[name] = list(deps)
+
+        if "settings" in job:
+            try:
+                _json_dumps_canonical(job["settings"])
+            except AssetError as exc:
+                errors.append(f"settings 无法序列化: {exc}")
+
+        if errors:
+            entries[index] = None
+            for message in errors:
+                fail(index, name, message)
+
+    # 依赖指向批内不存在的 job
+    for index, job in enumerate(jobs):
+        if entries[index] is None:
+            continue
+        name = entries[index]["name"]
+        missing = [d for d in job_deps.get(name, []) if d not in name_positions]
+        if missing:
+            fail(index, name, f"依赖的 job 不存在: {missing}")
+            entries[index] = None
+
+    # 大小写不敏感落盘路径冲突：冲突涉及的每个 job 都算失败
+    collision_jobs = set()
+    for ci, holders in case_keys.items():
+        distinct_case = {norm for norm, _ in holders}
+        distinct_jobs = {name for _, name in holders}
+        if len(distinct_case) > 1 or len(distinct_jobs) > 1:
+            collision_jobs.update(distinct_jobs)
+    for index, job in enumerate(jobs):
+        if entries[index] is None:
+            continue
+        name = entries[index]["name"]
+        if name in collision_jobs:
+            fail(index, name, "大小写不敏感的落盘路径冲突")
+            entries[index] = None
+
+    # 依赖成环：环上的每个 job 都算失败
+    valid_names = {n for n, i in name_positions.items() if entries[i] is not None}
+    graph = {
+        e["name"]: [d for d in job_deps.get(e["name"], []) if d in valid_names]
+        for e in entries
+        if e is not None
+    }
+    plan = resolve_dependencies(graph)
+    cyclic = {node for cyc in plan["cycles"] for node in cyc}
+    for index, job in enumerate(jobs):
+        if entries[index] is None:
+            continue
+        name = entries[index]["name"]
+        if name in cyclic:
+            fail(index, name, "依赖成环")
+            entries[index] = None
+
+    if errors_by_index:
+        return {
+            "ok": False,
+            "failed": [errors_by_index[i][0] for i in sorted(errors_by_index)],
+            "order": [],
+            "written": [],
+        }
+
+    # ---------------- 落盘阶段：先备份、失败整体回滚 ----------------
+    graph = {e["name"]: list(job_deps[e["name"]]) for e in entries}
+    order = resolve_dependencies(graph)["order"]
+
+    root_path = Path(root)
+    created_dirs = []
+    backups = {}  # 目标路径 -> 原内容（None 表示原先不存在）
+    written_rel = []
+
+    def ensure_dir(directory):
+        """创建目录，记录本批新建的每一级，供回滚删除。"""
+        missing = []
+        probe = directory
+        while not probe.exists():
+            missing.append(probe)
+            if probe.parent == probe:
+                break
+            probe = probe.parent
+        for target in reversed(missing):
+            target.mkdir()
+            created_dirs.append(target)
+
+    def rollback():
+        for rel in written_rel:
+            try:
+                (root_path / rel).unlink()
+            except OSError:
+                pass
+        for path, original in backups.items():
+            if original is None:
+                continue
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(original, encoding="utf-8")
+            except OSError:
+                pass
+        for directory in reversed(created_dirs):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+
+    failed_job = None
+    try:
+        for name in order:
+            failed_job = name
+            normalized = job_files[name]
+            for rel in sorted(normalized):
+                target = root_path / rel
+                if target not in backups:
+                    backups[target] = (
+                        target.read_text(encoding="utf-8") if target.exists() else None
+                    )
+                ensure_dir(target.parent)
+                with open(target, "w", encoding="utf-8") as handle:
+                    handle.write(normalized[rel])
+                written_rel.append(rel)
+    except (OSError, ValueError) as exc:
+        rollback()
+        return {
+            "ok": False,
+            "failed": [{"job": failed_job, "error": f"写入失败: {exc}"}],
+            "order": [],
+            "written": [],
+        }
+
+    return {
+        "ok": True,
+        "failed": [],
+        "order": order,
+        "written": sorted(written_rel),
+    }
